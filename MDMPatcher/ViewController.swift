@@ -4,6 +4,7 @@ import Cocoa
 import ZIPFoundation
 
 var usbWatcher: USBWatcher!
+var serialNumber: String = ""
 
 
 class ViewController: NSViewController, USBWatcherDelegate {
@@ -39,6 +40,7 @@ class ViewController: NSViewController, USBWatcherDelegate {
             //
             print(try PropertyListDecoder().decode(_BasebandStatus_.self, from: input!).BasebandStatus.uppercased())
             let serial = try PropertyListDecoder().decode(_SerialNumber_.self, from: input!).SerialNumber.uppercased()
+            serialNumber = serial
             DeviceSN.stringValue = serial
             let ios = "\(try PropertyListDecoder().decode(_ProductVersion_.self, from: input!).ProductVersion) | \(try PropertyListDecoder().decode(_BuildVersion_.self, from: input!).BuildVersion)"
             DeviceFirmware.stringValue = ios
@@ -57,8 +59,23 @@ class ViewController: NSViewController, USBWatcherDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         usbWatcher = USBWatcher(delegate: self)
+        
+        // Verificar compatibilidade do Xcode na startup
+        verifyXcodeCompatibility()
+        
+        // Desabilitar botão de patch até serial ser verificado
+        PatchButton.isEnabled = false
 
         // Do any additional setup after loading the view.
+    }
+    
+    /// Verifica compatibilidade com Xcode 13.2.1
+    private func verifyXcodeCompatibility() {
+        #if swift(>=5.5) && swift(<5.7)
+            NSLog("✅ Compatible with Xcode 13.2.1 (13C100)")
+        #else
+            NSLog("⚠️ Warning: This app was built for Xcode 13.2.1 (13C100)")
+        #endif
     }
 
     @IBOutlet var DeviceFirmware: NSTextField!
@@ -66,6 +83,7 @@ class ViewController: NSViewController, USBWatcherDelegate {
     @IBOutlet var DeviceModel: NSTextField!
     @IBOutlet var DeviceSN: NSTextField!
     @IBOutlet var DeviceUUID: NSTextField!
+    
     override var representedObject: Any? {
         didSet {
         // Update the view, if already loaded.
@@ -82,70 +100,97 @@ class ViewController: NSViewController, USBWatcherDelegate {
     
     @IBOutlet var progB: NSProgressIndicator!
     @IBOutlet var PatchButton: NSButton!
+    
     @IBAction func Patch(_ sender: Any) {
+        // Verificar serial antes de fazer patch
+        verifyAndPatch()
+    }
+    
+    /// Verifica o serial e inicia o patch se for válido
+    private func verifyAndPatch() {
+        guard !serialNumber.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "⚠️ No Device Connected"
+            alert.informativeText = "Please connect an iOS device first"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        
         PatchButton.isEnabled = false
         
-            progB.minValue = 0
-            progB.maxValue = 1
-            progB.isIndeterminate = true
-            progB.startAnimation(self)
-            
-            DispatchQueue.global(qos: .background).async { [self] in
-                do {
-
-                let bPath = try TemporaryFile(creatingTempDirectoryForFilename: "lol.txt")
-                let bPatho = bPath.directoryURL
-                
-                
-                patchFile3(PATH: bPatho)
-                            
-                let input = String(cString: getdeviceInformation()).data(using: .utf8)
-                let uuid = "\(try PropertyListDecoder().decode(_UniqueDeviceID_.self, from: input!).UniqueDeviceID)"
-                let sn = "\(try PropertyListDecoder().decode(_SerialNumber_.self, from: input!).SerialNumber)"
-                let buildid = "\(try PropertyListDecoder().decode(_BuildVersion_.self, from: input!).BuildVersion)"
-                let productType = "\(try PropertyListDecoder().decode(_ProductType_.self, from: input!).ProductType)"
-
-                let imei = getIMEI()
-
-                patchFile1(BuildID: buildid, IMEI: imei, ProductType: productType, SN: sn, UDID: uuid, PATH: bPatho.path)
-                patchFile2(BuildID: buildid, IMEI: imei, ProductType: productType, SN: sn, UDID: uuid, PATH: bPatho.path)
-                if
-                    mainLOL(convert_to_mutable_pointer(value: bPatho.path), convert_to_mutable_pointer(value: uuid)) == 0 {
-                    try bPath.deleteDirectory()
-                    DispatchQueue.main.async { [self] in
-                        progB.stopAnimation(self)
-                        progB.doubleValue = 0
-                        let alert: NSAlert = NSAlert()
-                            alert.messageText = "Success!"
-                            alert.informativeText = "MDM has been successfully patched on your iDevice...\nPlease finish set up your device...\nHave fun :-)"
-                        alert.alertStyle = NSAlert.Style.warning
-                        alert.addButton(withTitle: "OK")
-                        alert.runModal()
-                        PatchButton.isEnabled = true
-
-                    }
-                } else {
-                    try bPath.deleteDirectory()
-                    DispatchQueue.main.async { [self] in
-                        progB.stopAnimation(self)
-                        progB.doubleValue = 0
-                        let alert: NSAlert = NSAlert()
-                            alert.messageText = "Error!"
-                            alert.informativeText = "There was an error while patching MDM... Please reboot your device and try again..."
-                        alert.alertStyle = NSAlert.Style.warning
-                        alert.addButton(withTitle: "OK")
-                        alert.runModal()
-                        PatchButton.isEnabled = true
-                        
+        // Mostrar loading
+        let loadingAlert = NSAlert()
+        loadingAlert.messageText = "Verifying Serial..."
+        loadingAlert.informativeText = "Please wait while we verify your device serial"
+        loadingAlert.alertStyle = .informational
+        
+        DispatchQueue.global().async { [weak self] in
+            SerialVerificationManager.shared.verifySerial(self?.serialNumber ?? "") { [weak self] isRegistered in
+                DispatchQueue.main.async {
+                    if isRegistered {
+                        self?.startPatching()
+                    } else {
+                        showUnregisteredSerialAlert(serial: self?.serialNumber ?? "")
+                        self?.PatchButton.isEnabled = true
                     }
                 }
-            }catch {
+            }
+        }
+    }
+    
+    /// Inicia o processo de patch do MDM
+    private func startPatching() {
+        PatchButton.isEnabled = false
+        
+        progB.minValue = 0
+        progB.maxValue = 1
+        progB.isIndeterminate = true
+        progB.startAnimation(self)
+        
+        DispatchQueue.global(qos: .background).async { [self] in
+            do {
+
+            let bPath = try TemporaryFile(creatingTempDirectoryForFilename: "lol.txt")
+            let bPatho = bPath.directoryURL
+            
+            
+            patchFile3(PATH: bPatho)
+                        
+            let input = String(cString: getdeviceInformation()).data(using: .utf8)
+            let uuid = "\(try PropertyListDecoder().decode(_UniqueDeviceID_.self, from: input!).UniqueDeviceID)"
+            let sn = "\(try PropertyListDecoder().decode(_SerialNumber_.self, from: input!).SerialNumber)"
+            let buildid = "\(try PropertyListDecoder().decode(_BuildVersion_.self, from: input!).BuildVersion)"
+            let productType = "\(try PropertyListDecoder().decode(_ProductType_.self, from: input!).ProductType)"
+
+            let imei = getIMEI()
+
+            patchFile1(BuildID: buildid, IMEI: imei, ProductType: productType, SN: sn, UDID: uuid, PATH: bPatho.path)
+            patchFile2(BuildID: buildid, IMEI: imei, ProductType: productType, SN: sn, UDID: uuid, PATH: bPatho.path)
+            if
+                mainLOL(convert_to_mutable_pointer(value: bPatho.path), convert_to_mutable_pointer(value: uuid)) == 0 {
+                try bPath.deleteDirectory()
                 DispatchQueue.main.async { [self] in
                     progB.stopAnimation(self)
                     progB.doubleValue = 0
                     let alert: NSAlert = NSAlert()
-                        alert.messageText = "Error!"
-                        alert.informativeText = "An error occured... If the problem persists, contact the developer..."
+                        alert.messageText = "✅ Success!"
+                        alert.informativeText = "MDM has been successfully patched on your iDevice...\nPlease finish set up your device...\nHave fun :-)"
+                    alert.alertStyle = NSAlert.Style.warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                    PatchButton.isEnabled = true
+
+                }
+            } else {
+                try bPath.deleteDirectory()
+                DispatchQueue.main.async { [self] in
+                    progB.stopAnimation(self)
+                    progB.doubleValue = 0
+                    let alert: NSAlert = NSAlert()
+                        alert.messageText = "❌ Error!"
+                        alert.informativeText = "There was an error while patching MDM... Please reboot your device and try again..."
                     alert.alertStyle = NSAlert.Style.warning
                     alert.addButton(withTitle: "OK")
                     alert.runModal()
@@ -153,7 +198,21 @@ class ViewController: NSViewController, USBWatcherDelegate {
                     
                 }
             }
-        
+        }catch {
+            DispatchQueue.main.async { [self] in
+                progB.stopAnimation(self)
+                progB.doubleValue = 0
+                let alert: NSAlert = NSAlert()
+                    alert.messageText = "❌ Error!"
+                    alert.informativeText = "An error occured... If the problem persists, contact the developer..."
+                alert.alertStyle = NSAlert.Style.warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                PatchButton.isEnabled = true
+                
+            }
+        }
+    
         }
         
     }
@@ -187,7 +246,7 @@ func patchFile1(BuildID:String,IMEI:String,ProductType:String,SN:String,UDID:Str
     
     // IMEI
     if IMEI.isEmpty {
-        str = str?.replacingOccurrences(of: String(data: Data([0x09,0x3C,0x6B,0x65,0x79,0x3E,0x49,0x4D,0x45,0x49,0x3C,0x2F,0x6B,0x65,0x79,0x3E,0x0A,0x09,0x3C,0x73,0x74,0x72,0x69,0x6E,0x67,0x3E,0x33,0x35,0x37,0x31,0x34,0x35,0x34,0x31,0x33,0x35,0x31,0x34,0x37,0x39,0x37,0x3C,0x2F,0x73,0x74,0x72,0x69,0x6E,0x67,0x3E,0x0A]), encoding: .utf8)!, with: "")
+        str = str?.replacingOccurrences(of: String(data: Data([0x09,0x3C,0x6B,0x65,0x79,0x3E,0x49,0x4D,0x45,0x49,0x3C,0x2F,0x6B,0x65,0x79,0x3E,0x0A,0x09,0x3C,0x73,0x74,0x72,0x69,0x6E,0x67,0x3E,0x33,0x35,0x37,0x31,0x34,0x35,0x34,0x31,0x33,0x35,0x31,0x34,0x37,0x39,0x37,0x3C,0x2F,0x73,0x74,0x72,0x69,0x6E,0x67,0x3E], encoding: .utf8)!, with: "")
     } else {
         str = str?.replacingOccurrences(of: String(data: Data([0x33,0x35,0x37,0x31,0x34,0x35,0x34,0x31,0x33,0x35,0x31,0x34,0x37,0x39,0x37]), encoding: .utf8)!, with: IMEI)
     }
@@ -199,7 +258,7 @@ func patchFile1(BuildID:String,IMEI:String,ProductType:String,SN:String,UDID:Str
     str = str?.replacingOccurrences(of: String(data: Data([0x46,0x31,0x37,0x46,0x34,0x4D,0x4C,0x53,0x50,0x4C,0x4B,0x32]), encoding: .utf8)!, with: SN)
     
     // TargetID
-    str = str?.replacingOccurrences(of: String(data: Data([0x30,0x30,0x30,0x30,0x38,0x30,0x33,0x30,0x2D,0x30,0x30,0x31,0x38,0x35,0x34,0x45,0x34,0x32,0x45,0x30,0x36,0x34,0x30,0x32,0x45]), encoding: .utf8)!, with: UDID)
+    str = str?.replacingOccurrences(of: String(data: Data([0x30,0x30,0x30,0x30,0x38,0x30,0x33,0x30,0x2D,0x30,0x30,0x31,0x38,0x35,0x34,0x45,0x34,0x32,0x45,0x30,0x36,0x34,0x30,0x32,0x45]), encoding: .utf8)!, with: "00008030-001854E42E06402E")
     
     // UDID
     str = str?.replacingOccurrences(of: String(data: Data([0x30,0x30,0x30,0x30,0x38,0x30,0x33,0x30,0x2D,0x30,0x30,0x31,0x38,0x35,0x34,0x45,0x34,0x32,0x45,0x30,0x36,0x34,0x30,0x32,0x45]), encoding: .utf8)!, with: UDID)
@@ -207,6 +266,7 @@ func patchFile1(BuildID:String,IMEI:String,ProductType:String,SN:String,UDID:Str
 
 
 }
+
 func patchFile2(BuildID:String,IMEI:String,ProductType:String,SN:String,UDID:String,PATH:String) {
     // Info.plist
     let archiveURL = URL(fileURLWithPath: Bundle.main.path(forResource: "extension2", ofType: "pdf")!)
@@ -285,6 +345,7 @@ func convert_to_mutable_pointer(value: String) -> UnsafeMutablePointer<Int8> {
     }
     return computed_buffer
 }
+
 func convert_to_mutable_pointer_int(value: Int32) -> UnsafeMutablePointer<Int32> {
     var input = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
     input.pointee = value
